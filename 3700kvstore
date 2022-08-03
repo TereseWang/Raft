@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+
+import sys, socket, select, time, json, random
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+
+last = 0
+last_heartbeat = 0
+
+SELECT_WAIT_TIME = 0.01 # 10 milliseconds
+HEARTBEAT_INTERFAL = 0.1 # 100 milliseconds
+TERMINATOR = b'}\n'
+buffer = b''
+leader = 'FFFF'
+candidate = False
+term = 0
+votes_acquired = 0
+votes = {}
+
+def set_timeout():
+	return random.randrange(150, 300) * 0.001
+
+timeout = set_timeout()
+
+
+store = {} # key-value storage
+
+
+def log_debug(msg):
+	if 'heartbeat' in msg:
+		return
+	print("[debug] " + my_id + ": " + msg)
+
+def format_msg(msg, dst, type):
+	msg['src'] = my_id
+	msg['dst'] = dst
+	msg['leader'] = leader
+	msg['type'] = type
+	return msg
+
+def handle_message(msg):
+	global last
+	if msg['src'] == leader:
+		last = time.time()
+	# For now, ignore get() and put() from clients
+	if msg['type'] in ['get', 'put'] and not leader == my_id:
+		redirect_message(msg['src'], msg['MID'])
+	elif msg['type'] in 'get':
+		get_message(msg['src'], msg['MID'], msg['key'])
+	elif msg['type'] in 'put':
+		put_message(msg['src'], msg['MID'], msg['key'], msg['value'])
+	elif msg['type'] == 'request_vote':
+		vote_for(msg['term'], msg['src'])
+	elif msg['type'] in 'vote':
+		receive_vote(msg['term'], msg['src'])
+	elif msg['type'] == 'noop':
+		#log_debug(f"{msg['dst']} received a NOOP from {msg['src']}")
+		pass
+	elif msg['type'] == 'heartbeat':
+		recognize_leader(msg['term'], msg['src'])
+
+def get_message(dst, mid, key):
+	value = store[key]
+	#log_debug("getting key: " + str(key) + " value: " + str(value))
+	reply = format_msg({'MID' : mid, 'value' : value}, dst, 'ok')
+	send_msg(reply)
+
+def put_message(dst, mid, key, value):
+	#log_debug("putting key: " + str(key) + " value: " + str(value))
+	store[key] = value
+	reply = format_msg({'MID' : mid}, dst, 'ok')
+	send_msg(reply)
+
+def redirect_message(dst, mid):
+	reply = format_msg({'MID' : mid}, dst, 'redirect')
+	send_msg(reply)
+
+def start_election():
+	global leader, candidate, term, timeout, votes_acquired, votes, last
+	if term + 1 in votes:
+		return
+	#log_debug("starting election")
+	last = time.time()
+	timeout = set_timeout()
+	term += 1
+	candidate = True
+	leader = 'FFFF'
+
+	# vote for self
+	votes_acquired += 1
+	votes[term] = my_id
+
+	# request votes
+	for id in replica_ids:
+		msg = format_msg({'term' : term}, id, 'request_vote')
+		send_msg(msg)
+
+def vote_for(new_term, src):
+	global votes, term, last
+	if new_term in votes or term > new_term:
+		return
+	last = time.time()
+	#log_debug("voting for " + str(src) + " for term: " + str(term))
+	votes[new_term] = src
+	msg = format_msg({'term' : term}, src, 'vote')
+	send_msg(msg)
+
+def receive_vote(term, src):
+	global votes_acquired
+	if not candidate:
+		return
+	#log_debug("receiving vote for term " + str(term) + " from: " + str(src))
+	votes_acquired += 1
+
+	if votes_acquired > (len(replica_ids) + 1) / 2:
+		become_leader()
+
+def become_leader():
+	global leader, candidate, votes_acquired
+	#log_debug("becoming new leader under term: " + str(term))
+	leader = my_id
+	candidate = False
+	votes_acquired = 0
+
+	send_heartbeat()
+
+def send_heartbeat():
+	global last_heartbeat
+	for id in replica_ids:
+		msg = format_msg({'term' : term}, id, 'heartbeat')
+		send_msg(msg)
+	last_heartbeat = time.time()
+
+def recognize_leader(new_term, src):
+	#log_debug("received heartbeat from: " + str(msg['src']))
+	global leader, term, candidate, votes_acquired, last
+	if term > new_term:
+		return
+	last = time.time()
+	if term == new_term and leader == src:
+		return
+	#log_debug("recognizing leader: " + str(src) + " for term " + str(term))
+	term = new_term
+	leader = src
+	candidate = False
+	votes_acquired = 0
+
+def send_msg(msg):
+	#log_debug("sending msg " + str(msg))
+	sock.send(json.dumps(msg).encode() + b'\n')
+
+
+# Receive
+def recv_msgs(sock):
+	global buffer
+	fresh_buf = sock.recv(16384)
+	# is this sock shutting down?
+	if len(fresh_buf) == 0:
+			return None
+	buffer += fresh_buf
+	msgs = []
+	while TERMINATOR in buffer:
+		position = buffer.find(TERMINATOR) + len(TERMINATOR)
+		msgs.append(json.loads(buffer[:position - 1].decode()))  # -1 to remove the \n, which json.loads won't want
+		buffer = buffer[position:]
+	return msgs
+
+time.sleep(1)
+while True:
+	ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+	if sock in ready:
+		msgs = recv_msgs(sock)
+		for msg in msgs:
+			#log_debug("received msg: " + str(msg))
+			handle_message(msg)
+	clock = time.time()
+	if leader != my_id and not candidate and clock - last > timeout:
+		start_election()
+	if leader == my_id and clock - last_heartbeat > HEARTBEAT_INTERFAL:
+		send_heartbeat()
+
+	# clock = time.time()
+	# if clock-last > 2:
+	# 	# Send a no-op message to a random peer every two seconds, just for fun
+	# 	# You definitely want to remove this from your implementation
+	# 	msg = {'src': my_id, 'dst': random.choice(replica_ids), 'leader': 'FFFF', 'type': 'noop'}
+
+	# 	# Make sure to end all messages with \n
+	# 	sock.send(json.dumps(msg).encode() + b'\n')
+
+
+	# 	print(f"{msg['src']} sending a NOOP to {msg['dst']}")
+	# 	last = clock
